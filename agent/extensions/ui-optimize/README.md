@@ -18,7 +18,8 @@ Pi auto-discovers this directory through `index.ts`. Use `/reload` after editing
 - Image paste workflow:
   - clipboard image/file paths become `[imageN]` tokens in the editor;
   - tokens are rendered compactly;
-  - tokens expand back to paths on submit.
+  - tokens expand back to paths on submit;
+  - the editor is installed as a wrapper around any existing custom editor, so it can compose with `command-aliases.ts`.
 
 ## Files
 
