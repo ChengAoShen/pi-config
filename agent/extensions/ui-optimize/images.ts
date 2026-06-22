@@ -1,8 +1,9 @@
 import { spawnSync } from "node:child_process";
 
 import type { AppKeybinding, KeybindingsManager, Theme } from "@earendil-works/pi-coding-agent";
-import { Editor, getKeybindings, matchesKey, truncateToWidth, type EditorComponent, type EditorTheme, type TUI } from "@earendil-works/pi-tui";
+import { Editor, matchesKey, truncateToWidth, type EditorComponent, type EditorTheme, type TUI } from "@earendil-works/pi-tui";
 
+import { EditorComponentWrapper } from "../shared/editor-wrapper.ts";
 import { CLIPBOARD_PATH_RE, IMAGE_FILE_RE, MACOS_CLIPBOARD_FILE_PATHS_SCRIPT, TOKEN_LINE_RE, TOKEN_RE } from "./constants.ts";
 
 type Attachment = { token: string; path: string };
@@ -73,8 +74,7 @@ class ImageTokenController {
     tui.requestRender();
   }
 
-  deleteTokenAtCursor(editor: EditorComponent, data: string, tui: TUI): boolean {
-    const keybindings = getKeybindings();
+  deleteTokenAtCursor(editor: EditorComponent, data: string, tui: TUI, keybindings: KeybindingsManager): boolean {
     const backward = keybindings.matches(data, "tui.editor.deleteCharBackward") || matchesKey(data, "shift+backspace");
     const forward = keybindings.matches(data, "tui.editor.deleteCharForward") || matchesKey(data, "shift+delete");
     if (!backward && !forward) return false;
@@ -204,7 +204,7 @@ class ImageEditor extends Editor {
 
   handleInput(data: string): void {
     if (this.onExtensionShortcut?.(data)) return;
-    if (this.imageTokens.deleteTokenAtCursor(this, data, this.tui)) return;
+    if (this.imageTokens.deleteTokenAtCursor(this, data, this.tui, this.keybindings)) return;
 
     if (this.keybindings.matches(data, "app.clipboard.pasteImage")) {
       if (pasteClipboardPaths(this, this.imageTokens, this.tui)) return;
@@ -235,42 +235,18 @@ class ImageEditor extends Editor {
   }
 }
 
-class ImageEditorWrapper implements EditorComponent {
-  actionHandlers = new Map<AppKeybinding, () => void>();
+class ImageEditorWrapper extends EditorComponentWrapper {
   private scanTimers: Array<ReturnType<typeof setTimeout>> = [];
-  private _onSubmit: ((text: string) => void) | undefined;
-  private _onChange: ((text: string) => void) | undefined;
-  onEscape: (() => void) | undefined;
-  onCtrlD: (() => void) | undefined;
-  onPasteImage: (() => void) | undefined;
-  onExtensionShortcut: ((data: string) => boolean) | undefined;
 
   constructor(
-    private readonly inner: EditorComponent,
+    inner: EditorComponent,
     private readonly tui: TUI,
     readonly keybindings: KeybindingsManager,
     private readonly imageTokens: ImageTokenController,
     private readonly getTheme: () => Theme,
-  ) {}
-
-  get focused(): boolean { return Boolean((this.inner as EditorComponent & { focused?: boolean }).focused); }
-  set focused(value: boolean) { (this.inner as EditorComponent & { focused?: boolean }).focused = value; }
-  get borderColor(): ((str: string) => string) | undefined { return this.inner.borderColor; }
-  set borderColor(value: ((str: string) => string) | undefined) { this.inner.borderColor = value; }
-  get onSubmit(): ((text: string) => void) | undefined { return this._onSubmit; }
-  set onSubmit(handler: ((text: string) => void) | undefined) { this._onSubmit = handler; this.inner.onSubmit = handler; }
-  get onChange(): ((text: string) => void) | undefined { return this._onChange; }
-  set onChange(handler: ((text: string) => void) | undefined) { this._onChange = handler; this.inner.onChange = handler; }
-
-  getText(): string { return this.inner.getText(); }
-  setText(text: string): void { this.inner.setText(text); }
-  getExpandedText(): string { return this.inner.getExpandedText?.() ?? this.inner.getText(); }
-  addToHistory(text: string): void { this.inner.addToHistory?.(text); }
-  setAutocompleteProvider(provider: Parameters<NonNullable<EditorComponent["setAutocompleteProvider"]>>[0]): void { this.inner.setAutocompleteProvider?.(provider); }
-  setPaddingX(padding: number): void { this.inner.setPaddingX?.(padding); }
-  setAutocompleteMaxVisible(maxVisible: number): void { this.inner.setAutocompleteMaxVisible?.(maxVisible); }
-  onAction(action: AppKeybinding, handler: () => void): void { this.actionHandlers.set(action, handler); }
-  invalidate(): void { this.inner.invalidate?.(); }
+  ) {
+    super(inner);
+  }
 
   insertTextAtCursor(text: string): void {
     const next = this.imageTokens.replaceClipboardPaths(text, this.inner.getText());
@@ -287,7 +263,7 @@ class ImageEditorWrapper implements EditorComponent {
 
   handleInput(data: string): void {
     if (this.onExtensionShortcut?.(data)) return;
-    if (this.imageTokens.deleteTokenAtCursor(this.inner, data, this.tui)) return;
+    if (this.imageTokens.deleteTokenAtCursor(this.inner, data, this.tui, this.keybindings)) return;
 
     if (this.keybindings.matches(data, "app.clipboard.pasteImage")) {
       if (pasteClipboardPaths(this, this.imageTokens, this.tui)) return;
@@ -302,10 +278,6 @@ class ImageEditorWrapper implements EditorComponent {
 
   private handleAppAction(data: string): boolean {
     return handleAppAction(this, data);
-  }
-
-  isShowingAutocomplete(): boolean {
-    return (this.inner as EditorComponent & { isShowingAutocomplete?: () => boolean }).isShowingAutocomplete?.() ?? false;
   }
 
   private scheduleScan(): void {
