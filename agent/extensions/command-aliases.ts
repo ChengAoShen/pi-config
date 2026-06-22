@@ -1,5 +1,5 @@
 /**
- * Personal plugin: map bare editor input to built-in slash commands.
+ * Command aliases: map bare editor input to built-in slash commands.
  *
  * Current aliases:
  * - `exit`  -> `/quit`
