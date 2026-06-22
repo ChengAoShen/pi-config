@@ -239,7 +239,7 @@ function toolStatus(tool: ToolLike): string {
   if (tool.result?.isError) return "✗";
   if (tool.result) return "✓";
   if (tool.executionStarted) return "…";
-  return "○";
+  return "·";
 }
 
 function toolState(tool: ToolLike): string {
@@ -292,11 +292,6 @@ function compactStartToWidth(text: string, width: number): string {
   return `${head}… ${text.slice(low)}`;
 }
 
-function thinkingLine(thinkingTexts: string[], width: number): string | undefined {
-  if (thinkingTexts.length === 0) return undefined;
-  return `  💭 ${compactStartToWidth(thinkingTexts.join(" · "), Math.max(1, width - 5))}`;
-}
-
 function padToWidth(text: string, width: number): string {
   return text + " ".repeat(Math.max(0, width - visibleWidth(text)));
 }
@@ -307,7 +302,49 @@ function fg(color: string, text: string): string {
   return runtimeTheme?.fg?.(color, text) ?? text;
 }
 
-function frameActivityBlock(lines: string[], width: number): string[] {
+function bold(text: string): string {
+  return runtimeTheme?.bold?.(text) ?? text;
+}
+
+function statusColor(tool: ToolLike): string {
+  if (tool.result?.isError) return "error";
+  if (tool.result) return "success";
+  if (tool.executionStarted) return "warning";
+  return "muted";
+}
+
+function statusSummary(tools: ToolLike[]): string {
+  const done = tools.filter((tool) => tool.result && !tool.result.isError).length;
+  const failed = tools.filter((tool) => tool.result?.isError).length;
+  const running = tools.filter((tool) => !tool.result && tool.executionStarted).length;
+  const pending = tools.length - done - failed - running;
+  const parts = [fg("success", `✓${done}`)];
+  if (running > 0) parts.push(fg("warning", `…${running}`));
+  if (failed > 0) parts.push(fg("error", `✗${failed}`));
+  if (pending > 0) parts.push(fg("muted", `·${pending}`));
+  return parts.join("  ");
+}
+
+function thinkingSummaryLine(thinkingTexts: string[], width: number): string | undefined {
+  if (thinkingTexts.length === 0) return undefined;
+  const label = `${fg("accent", bold("💭 think"))} ${fg("accent", `×${thinkingTexts.length}`)}`;
+  const preview = compactStartToWidth(thinkingTexts.join(" · "), Math.max(1, width - 20));
+  return `${label}   ${fg("muted", "┆")} ${fg("dim", preview)}`;
+}
+
+function toolsSummaryLine(tools: ToolLike[]): string {
+  const label = `${fg("accent", bold("🛠 tools"))} ${fg("accent", `×${tools.length}`)}`;
+  return `${label}   ${statusSummary(tools)}`;
+}
+
+function toolRow(tool: ToolLike, width: number): string {
+  const name = padToWidth(tool.toolName ?? "tool", 10);
+  const arg = toolArgSummary(tool).trimStart();
+  const row = `  ${fg(statusColor(tool), toolStatus(tool))} ${fg("accent", name)}${arg ? ` ${fg("dim", arg)}` : ""}`;
+  return truncateToWidth(row, width, "");
+}
+
+function frameActivityBlock(lines: string[], width: number, hint: string): string[] {
   if (width < 8) return lines;
 
   const leadingBlank = lines[0] === "" ? [""] : [];
@@ -315,57 +352,36 @@ function frameActivityBlock(lines: string[], width: number): string[] {
   if (body.length === 0) return lines;
 
   const innerWidth = Math.max(1, width - 4);
-  const border = (text: string) => fg("borderMuted", text);
+  const border = (text: string) => fg("muted", text);
+  const title = ` ${fg("accent", bold("activity"))} `;
+  const titleWidth = visibleWidth(" activity ");
+  const topFill = Math.max(0, width - 2 - titleWidth - 1);
+  const hintText = hint ? ` ${fg("dim", hint)} ` : "";
+  const bottomFill = Math.max(0, width - 2 - visibleWidth(hintText));
+
   return [
     ...leadingBlank,
-    border(`╭${"─".repeat(Math.max(0, width - 2))}╮`),
+    `${border("╭─")}${title}${border("─".repeat(topFill))}${border("╮")}`,
     ...body.map((line) => `${border("│ ")}${padToWidth(truncateToWidth(line, innerWidth, ""), innerWidth)}${border(" │")}`),
-    border(`╰${"─".repeat(Math.max(0, width - 2))}╯`),
+    `${border("╰")}${border("─".repeat(bottomFill))}${hintText}${border("╯")}`,
   ];
 }
 
-function renderSingleToolGroup(tool: ToolLike, thinkingTexts: string[], width: number): string[] {
-  const title = thinkingTexts.length > 0
-    ? `💭 Thinking ×${thinkingTexts.length} (Ctrl+T) · 🛠 ${tool.toolName ?? "tool"} (Ctrl+O)${toolArgSummary(tool)}`
-    : `🛠 ${tool.toolName ?? "tool"} (Ctrl+O)${toolArgSummary(tool)}`;
-
-  const lines = ["", truncateToWidth(title, width, ""), truncateToWidth(`  ${toolStatus(tool)} ${toolState(tool)}`, width, "")];
-  const thought = thinkingLine(thinkingTexts, width);
+function renderActivityGroup(tools: ToolLike[], thinkingTexts: string[], width: number): string[] {
+  const lines = [""];
+  const thought = thinkingSummaryLine(thinkingTexts, width);
   if (thought) lines.push(truncateToWidth(thought, width, ""));
-  return lines;
-}
-
-function renderMultiToolGroup(tools: ToolLike[], thinkingTexts: string[], width: number): string[] {
-  const counts = new Map<string, number>();
-  for (const tool of tools) counts.set(tool.toolName ?? "tool", (counts.get(tool.toolName ?? "tool") ?? 0) + 1);
-
-  const summary = [...counts.entries()].map(([name, count]) => `${name}${count > 1 ? ` ×${count}` : ""}`).join(", ");
-  const done = tools.filter((tool) => tool.result && !tool.result.isError).length;
-  const failed = tools.filter((tool) => tool.result?.isError).length;
-  const running = tools.length - done - failed;
-  const title = thinkingTexts.length > 0
-    ? `💭 Thinking ×${thinkingTexts.length} (Ctrl+T) · 🛠 Tools ×${tools.length} (Ctrl+O): ${summary}`
-    : `🛠 Tools ×${tools.length} (Ctrl+O): ${summary}`;
-
-  const lines = [
-    "",
-    truncateToWidth(title, width, ""),
-    truncateToWidth(`  ${done} done${running ? `, ${running} running` : ""}${failed ? `, ${failed} failed` : ""}`, width, ""),
-  ];
-
-  const thought = thinkingLine(thinkingTexts, width);
-  if (thought) lines.push(truncateToWidth(thought, width, ""));
+  lines.push(truncateToWidth(toolsSummaryLine(tools), width, ""));
 
   const hiddenCount = Math.max(0, tools.length - MAX_TOOL_ROWS);
   if (hiddenCount > 0) {
-    lines.push(truncateToWidth(`  … ${hiddenCount} earlier tool call${hiddenCount === 1 ? "" : "s"}`, width, ""));
+    lines.push(truncateToWidth(`  ${fg("muted", "…")} ${fg("dim", `${hiddenCount} earlier tool call${hiddenCount === 1 ? "" : "s"}`)}`, width, ""));
   }
 
-  for (const tool of tools.slice(-MAX_TOOL_ROWS)) {
-    lines.push(truncateToWidth(`  ${toolStatus(tool)} ${tool.toolName ?? "tool"}${toolArgSummary(tool)}`, width, ""));
-  }
+  for (const tool of tools.slice(-MAX_TOOL_ROWS)) lines.push(toolRow(tool, width));
 
-  return lines;
+  const hint = thinkingTexts.length > 0 ? "Ctrl+O/T" : "Ctrl+O";
+  return frameActivityBlock(lines, width, hint);
 }
 
 function toolGroupCacheKey(group: ToolGroup, width: number): string {
@@ -385,16 +401,17 @@ function renderToolGroup(first: ToolLike, width: number): string[] | undefined {
   const cached = first[TOOL_GROUP_RENDER_CACHE];
   if (cached?.key === key) return cached.lines;
 
-  const lines = group.tools.length === 1
-    ? renderSingleToolGroup(group.tools[0]!, group.thinkingTexts, width)
-    : renderMultiToolGroup(group.tools, group.thinkingTexts, width);
+  const lines = renderActivityGroup(group.tools, group.thinkingTexts, width);
 
   const errorLine = firstErrorLine(group.tools);
-  if (errorLine) lines.push(truncateToWidth(errorLine, width, ""));
+  if (errorLine && lines.length > 2) {
+    const border = (text: string) => fg("muted", text);
+    const innerWidth = Math.max(1, width - 4);
+    lines.splice(-1, 0, `${border("│ ")}${padToWidth(truncateToWidth(fg("error", errorLine.trimStart()), innerWidth, ""), innerWidth)}${border(" │")}`);
+  }
 
-  const framed = frameActivityBlock(lines, width);
-  first[TOOL_GROUP_RENDER_CACHE] = { key, lines: framed };
-  return framed;
+  first[TOOL_GROUP_RENDER_CACHE] = { key, lines };
+  return lines;
 }
 
 function isContinuationOfCollapsedToolGroup(tool: ToolLike): boolean {
@@ -413,7 +430,7 @@ function isContinuationOfCollapsedToolGroup(tool: ToolLike): boolean {
 export async function installToolExecutionGroupingPatch(): Promise<void> {
   installContainerParentPatch();
 
-  let components: Awaited<ReturnType<typeof loadInteractiveComponents>>;
+  let components: Awaited<ReturnType<typeof loadInteractiveRuntime>>;
   try {
     components = await loadInteractiveRuntime();
     runtimeTheme = components.theme;

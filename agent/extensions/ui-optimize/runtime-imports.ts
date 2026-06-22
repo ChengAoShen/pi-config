@@ -3,7 +3,7 @@ import { pathToFileURL } from "node:url";
 
 import { getCodingAgentRoot } from "./paths.ts";
 
-export type RuntimeTheme = { fg?: (color: string, text: string) => string };
+export type RuntimeTheme = { fg?: (color: string, text: string) => string; bold?: (text: string) => string };
 
 export async function loadInteractiveRuntime(): Promise<{
 	ToolExecutionComponent?: { prototype: Record<PropertyKey, unknown> };

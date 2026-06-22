@@ -4,14 +4,14 @@ A bundled Pi extension for background execution used by the main agent.
 
 ## Responsibilities
 
-- `background-shell.ts`: long-running non-interactive shell commands via `bg_shell_*` tools.
-- `sub-agents.ts`: parallel headless Pi workers via the `sub_agent` tool.
+- `background-shell.ts`: long-running non-interactive shell commands via the unified `bg_shell` tool.
+- `sub-agents.ts`: headless Pi workers via the `sub_agent` tool. One unified `start` action handles single and parallel tasks; `returnToMain` can send results back automatically.
 - `job-monitor.ts`: shared footer status and focused right-side jobs overlay.
 - `index.ts`: plugin entry point.
 
 ## Design
 
-The tools are agent-facing infrastructure. Users should normally ask the main agent for an outcome, while the main agent starts, waits for, checks, and cancels background work as needed.
+The tools are agent-facing infrastructure. Users should normally ask the main agent for an outcome, while the main agent starts, waits for, checks, and cancels background work as needed. For detached work that should resume the main agent automatically, use `sub_agent` or `bg_shell` with `action: "start"` and `returnToMain: true`.
 
 The user-facing UI is observational:
 

@@ -25,8 +25,9 @@ const DEFAULT_TOOLS = ["read", "grep", "find", "ls"];
 const DEFAULT_THINKING = "medium";
 
 type AgentStatus = "running" | "exited" | "failed" | "timed_out" | "cancelled";
-type Action = "start" | "start_many" | "status" | "wait" | "cancel";
+type Action = "start" | "status" | "wait" | "cancel";
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+type ReturnDelivery = "steer" | "followUp" | "nextTurn";
 
 type MainToolProgress = {
 	id: string;
@@ -274,6 +275,7 @@ type JobsMonitor = ReturnType<typeof createJobsMonitor>;
 
 export function installSubAgents(pi: ExtensionAPI, jobsMonitor: JobsMonitor) {
 	let nextAgentNumber = 1;
+	let shuttingDown = false;
 	const jobs = new Map<string, SubAgentJob>();
 	const monitor = jobsMonitor.registerSource({
 		id: "agents",
@@ -290,6 +292,7 @@ export function installSubAgents(pi: ExtensionAPI, jobsMonitor: JobsMonitor) {
 	});
 
 	pi.on("agent_start", async () => {
+		shuttingDown = false;
 		mainToolProgress.clear();
 		writeMainProgressSnapshot();
 	});
@@ -440,22 +443,46 @@ export function installSubAgents(pi: ExtensionAPI, jobsMonitor: JobsMonitor) {
 		return ids.length ? ids : [...jobs.keys()];
 	}
 
+	function returnSubAgentResultsToMain(completedJobs: SubAgentJob[], delivery: ReturnDelivery, instruction?: string): void {
+		if (shuttingDown || completedJobs.length === 0) return;
+
+		const summaries = completedJobs.map((job) => summarizeJob(job)).join("\n\n---\n\n");
+		const defaultInstruction =
+			"Sub-agent work has completed. Read these returned results, synthesize the findings, and continue the original task. Do not ask the user to manually inspect job ids unless more information is needed.";
+		pi.sendMessage(
+			{
+				customType: "sub-agent-return",
+				content: `${instruction?.trim() || defaultInstruction}\n\n${summaries}`,
+				display: true,
+				details: { ids: completedJobs.map((job) => job.id), statuses: completedJobs.map((job) => job.status) },
+			},
+			{ deliverAs: delivery, triggerTurn: delivery !== "nextTurn" },
+		);
+	}
+
+	function scheduleReturnToMain(completedJobs: SubAgentJob[], delivery: ReturnDelivery, instruction?: string): void {
+		void (async () => {
+			for (const job of completedJobs) await waitForJob(job, undefined, undefined);
+			returnSubAgentResultsToMain(completedJobs, delivery, instruction);
+		})().catch(() => undefined);
+	}
+
 	pi.registerTool({
 		name: "sub_agent",
 		label: "Sub Agent",
-		description: "Start, inspect, wait for, or cancel headless pi sub-agents. Supports starting many independent sub-agents concurrently for parallel analysis. Sub-agents are read-only by default, run with --no-session --no-extensions, and receive a snapshot/path for parent tool progress.",
-		promptSnippet: "Run multiple headless pi sub-agents concurrently for delegated analysis",
+		description: "Start, inspect, wait for, or cancel headless pi sub-agents. action=start accepts either one task or a tasks array for parallel work; set returnToMain=true to automatically send completed results back to the main agent. Sub-agents are read-only by default, run with --no-session --no-extensions, and receive parent progress.",
+		promptSnippet: "Run one or more headless pi sub-agents for delegated analysis",
 		promptGuidelines: [
-			"Use sub_agent start_many when a task can be decomposed into independent research, code review, test analysis, or planning subtasks that benefit from concurrent agents.",
+			"Use sub_agent action=start with tasks:[...] when a task can be decomposed into independent research, code review, test analysis, or planning subtasks that benefit from concurrent agents.",
 			"Prefer default read-only sub-agents. The parent agent should synthesize results and perform final edits.",
 			`Do not start more than ${MAX_START_MANY} sub-agents at once unless the user explicitly requests a different approach; this tool enforces a hard limit of ${MAX_START_MANY} running sub-agents.`,
 			"Sub-agents receive parent tool progress as situational awareness; if they need the freshest state and have read access, they can read the provided progress file.",
-			"After sub_agent start or start_many, call sub_agent wait before relying on the results.",
+			"After sub_agent action=start, either call sub_agent action=wait before relying on results, or set returnToMain=true so results are automatically returned as a follow-up to the main agent.",
 			"Sub-agents run with --no-extensions, so they cannot recursively create more sub-agents.",
 		],
 		parameters: Type.Object({
-			action: StringEnum(["start", "start_many", "status", "wait", "cancel"] as const),
-			task: Type.Optional(Type.String({ description: "Task for action=start." })),
+			action: StringEnum(["start", "status", "wait", "cancel"] as const),
+			task: Type.Optional(Type.String({ description: "Single task for action=start. Mutually exclusive with tasks." })),
 			role: Type.Optional(Type.String({ description: "Optional role for action=start." })),
 			label: Type.Optional(Type.String({ description: "Optional label for action=start." })),
 			cwd: Type.Optional(Type.String({ description: "Working directory for action=start." })),
@@ -464,38 +491,47 @@ export function installSubAgents(pi: ExtensionAPI, jobsMonitor: JobsMonitor) {
 			provider: Type.Optional(Type.String({ description: "Optional provider for action=start." })),
 			thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"] as const)),
 			timeoutSeconds: Type.Optional(Type.Number({ description: "Maximum runtime for action=start." })),
-			tasks: Type.Optional(Type.Array(TaskSchema, { description: `Tasks for action=start_many. Maximum ${MAX_START_MANY}.` })),
+			tasks: Type.Optional(Type.Array(TaskSchema, { description: `Parallel tasks for action=start. Mutually exclusive with task. Maximum ${MAX_START_MANY}.` })),
+			returnToMain: Type.Optional(Type.Boolean({ description: "For action=start, automatically send completed sub-agent results back to the main agent and trigger continuation. Default: false." })),
+			returnDelivery: Type.Optional(StringEnum(["steer", "followUp", "nextTurn"] as const, { description: "Delivery mode when returnToMain=true. Default: followUp." })),
+			returnInstruction: Type.Optional(Type.String({ description: "Optional instruction prepended to the automatic return message for the parent agent." })),
 			jobId: Type.Optional(Type.String({ description: "Single sub-agent id for status/wait/cancel." })),
 			jobIds: Type.Optional(Type.Array(Type.String(), { description: "Multiple sub-agent ids for status/wait/cancel. Omit jobId/jobIds to target all jobs." })),
 			waitTimeoutSeconds: Type.Optional(Type.Number({ description: "Maximum time to wait for action=wait. If it expires, running sub-agents continue." })),
 		}),
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const action = params.action as Action;
+			const returnToMain = Boolean(params.returnToMain);
+			const returnDelivery = (params.returnDelivery ?? "followUp") as ReturnDelivery;
+			const returnInstruction = params.returnInstruction as string | undefined;
 
 			if (action === "start") {
-				if (!params.task) throw new Error("sub_agent action=start requires task");
-				const job = await startSubAgent(params as AgentTask, ctx.cwd);
-				monitor.update(ctx);
-				return {
-					content: [{ type: "text", text: `Started sub-agent ${job.id}${job.label ? ` (${job.label})` : ""}\nRole: ${job.role ?? "general"}\nCWD: ${job.cwd}\nTools: ${job.tools.join(",")}\nPrompt: ${job.promptPath}\nLog: ${job.logPath}\nParent progress: ${MAIN_PROGRESS_PATH}` }],
-					details: { id: job.id, status: job.status, promptPath: job.promptPath, logPath: job.logPath, parentProgressPath: MAIN_PROGRESS_PATH },
-				};
-			}
+				const hasSingle = Boolean(params.task);
+				const hasTasks = Boolean(params.tasks?.length);
+				if (hasSingle === hasTasks) throw new Error("sub_agent action=start requires exactly one of task or tasks");
 
-			if (action === "start_many") {
-				if (!params.tasks?.length) throw new Error("sub_agent action=start_many requires tasks");
-				if (params.tasks.length > MAX_START_MANY) throw new Error(`start_many supports at most ${MAX_START_MANY} tasks`);
+				const tasks = hasTasks ? (params.tasks as AgentTask[]) : [params as AgentTask];
+				if (tasks.length > MAX_START_MANY) throw new Error(`sub_agent action=start supports at most ${MAX_START_MANY} tasks`);
 				const running = [...jobs.values()].filter((job) => job.status === "running").length;
-				if (running + params.tasks.length > MAX_START_MANY) {
-					throw new Error(`Cannot start ${params.tasks.length} sub-agents: ${running} already running and the limit is ${MAX_START_MANY}. Wait or cancel some before starting more.`);
+				if (running + tasks.length > MAX_START_MANY) {
+					throw new Error(`Cannot start ${tasks.length} sub-agent(s): ${running} already running and the limit is ${MAX_START_MANY}. Wait or cancel some before starting more.`);
 				}
+
 				const started: SubAgentJob[] = [];
-				for (const task of params.tasks as AgentTask[]) {
-					started.push(await startSubAgent(task, ctx.cwd));
-				}
+				for (const task of tasks) started.push(await startSubAgent(task, ctx.cwd));
+				if (returnToMain) scheduleReturnToMain(started, returnDelivery, returnInstruction);
 				monitor.update(ctx);
+
+				if (started.length === 1) {
+					const job = started[0];
+					return {
+						content: [{ type: "text", text: `Started sub-agent ${job.id}${job.label ? ` (${job.label})` : ""}${returnToMain ? " with automatic return to main agent" : ""}\nRole: ${job.role ?? "general"}\nCWD: ${job.cwd}\nTools: ${job.tools.join(",")}\nPrompt: ${job.promptPath}\nLog: ${job.logPath}\nParent progress: ${MAIN_PROGRESS_PATH}` }],
+						details: { id: job.id, status: job.status, promptPath: job.promptPath, logPath: job.logPath, parentProgressPath: MAIN_PROGRESS_PATH, returnsToMain: returnToMain },
+					};
+				}
+
 				const lines = started.map((job) => `${job.id}\t${job.status}\t${job.label ?? job.role ?? "sub-agent"}\t${job.logPath}`);
-				return { content: [{ type: "text", text: `Started ${started.length} sub-agents concurrently:\n${lines.join("\n")}\nParent progress: ${MAIN_PROGRESS_PATH}` }], details: { ids: started.map((job) => job.id), parentProgressPath: MAIN_PROGRESS_PATH } };
+				return { content: [{ type: "text", text: `Started ${started.length} sub-agents concurrently${returnToMain ? " with automatic return to main agent" : ""}:\n${lines.join("\n")}\nParent progress: ${MAIN_PROGRESS_PATH}` }], details: { ids: started.map((job) => job.id), parentProgressPath: MAIN_PROGRESS_PATH, returnsToMain: returnToMain } };
 			}
 
 			if (action === "status") {
@@ -555,6 +591,7 @@ export function installSubAgents(pi: ExtensionAPI, jobsMonitor: JobsMonitor) {
 	});
 
 	pi.on("session_shutdown", async () => {
+		shuttingDown = true;
 		for (const job of jobs.values()) {
 			if (job.status !== "running") continue;
 			finishJob(job, "cancelled", null, "SIGTERM", "Cancelled by session shutdown");

@@ -10,6 +10,7 @@ import { createWriteStream, type WriteStream } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { appendTail as appendTailText, formatDuration, RESULT_LIMIT_BYTES, shellQuote, timestampForFile, truncateTail } from "../shared/shell.ts";
@@ -19,6 +20,7 @@ const LOG_DIR = join(homedir(), ".pi", "agent", "tmp", "background-shell");
 const TERM_GRACE_MS = 3000;
 
 type JobStatus = "running" | "exited" | "failed" | "timed_out" | "cancelled";
+type ReturnDelivery = "steer" | "followUp" | "nextTurn";
 
 type BackgroundJob = {
 	id: string;
@@ -127,6 +129,7 @@ type JobsMonitor = ReturnType<typeof createJobsMonitor>;
 
 export function installBackgroundShell(pi: ExtensionAPI, jobsMonitor: JobsMonitor) {
 	let nextJobNumber = 1;
+	let shuttingDown = false;
 	const jobs = new Map<string, BackgroundJob>();
 	const monitor = jobsMonitor.registerSource({
 		id: "shell",
@@ -142,166 +145,180 @@ export function installBackgroundShell(pi: ExtensionAPI, jobsMonitor: JobsMonito
 		})),
 	});
 
+	function returnShellResultToMain(job: BackgroundJob, delivery: ReturnDelivery, instruction?: string): void {
+		if (shuttingDown) return;
+		const defaultInstruction =
+			"Background shell job has completed. Read this returned result, use it to continue the original task, and do not ask the user to manually inspect the job id unless more information is needed.";
+		pi.sendMessage(
+			{
+				customType: "bg-shell-return",
+				content: `${instruction?.trim() || defaultInstruction}\n\n${summarizeJob(job)}`,
+				display: true,
+				details: { id: job.id, status: job.status, exitCode: job.exitCode, logPath: job.logPath },
+			},
+			{ deliverAs: delivery, triggerTurn: delivery !== "nextTurn" },
+		);
+	}
+
+	function scheduleReturnToMain(job: BackgroundJob, delivery: ReturnDelivery, instruction?: string): void {
+		void waitForJob(job, undefined, undefined)
+			.then(() => returnShellResultToMain(job, delivery, instruction))
+			.catch(() => undefined);
+	}
+
 	pi.registerTool({
-		name: "bg_shell_start",
-		label: "Background Shell Start",
-		description: "Start a non-interactive shell command in the background and immediately return a job id. Output is captured to a log file and a tail buffer.",
-		promptSnippet: "Start long-running non-interactive shell commands as background jobs",
+		name: "bg_shell",
+		label: "Background Shell",
+		description: "Manage non-interactive shell commands as background jobs. Use action=start for long-running commands; set returnToMain=true to automatically send the completed result back to the main agent. Use action=status to inspect jobs, action=wait to wait, and action=cancel to terminate a running job.",
+		promptSnippet: "Start, inspect, wait for, or cancel long-running shell commands as background jobs",
 		promptGuidelines: [
-			"Use bg_shell_start for long-running commands such as builds, tests, dev servers, migrations, downloads, or commands expected to take more than about 10 seconds.",
+			"Use bg_shell action=start for long-running commands such as builds, tests, dev servers, migrations, downloads, or commands expected to take more than about 10 seconds.",
 			"Use the regular bash tool for short one-off shell commands.",
-			"After bg_shell_start, call bg_shell_status or bg_shell_wait before relying on the command result.",
-			"Do not use bg_shell_start for commands that require interactive stdin.",
+			"After bg_shell action=start, either call bg_shell action=status/action=wait before relying on the command result, or set returnToMain=true so the result is automatically returned as a follow-up to the main agent.",
+			"Do not use bg_shell action=start for commands that require interactive stdin.",
 		],
 		parameters: Type.Object({
-			command: Type.String({ description: "Shell command to run via the user's shell." }),
-			cwd: Type.Optional(Type.String({ description: "Working directory. Relative paths are resolved against the current cwd." })),
-			timeoutSeconds: Type.Optional(Type.Number({ description: "Optional maximum runtime. If exceeded, the job is terminated and marked timed_out." })),
-			label: Type.Optional(Type.String({ description: "Optional human-readable label." })),
+			action: StringEnum(["start", "status", "wait", "cancel"] as const),
+			command: Type.Optional(Type.String({ description: "Shell command to run for action=start." })),
+			cwd: Type.Optional(Type.String({ description: "Working directory for action=start. Relative paths are resolved against the current cwd." })),
+			timeoutSeconds: Type.Optional(Type.Number({ description: "Optional maximum runtime for action=start. If exceeded, the job is terminated and marked timed_out." })),
+			label: Type.Optional(Type.String({ description: "Optional human-readable label for action=start." })),
+			returnToMain: Type.Optional(Type.Boolean({ description: "For action=start, automatically send the completed job result back to the main agent and trigger continuation. Default: false." })),
+			returnDelivery: Type.Optional(StringEnum(["steer", "followUp", "nextTurn"] as const, { description: "Delivery mode when returnToMain=true. Default: followUp." })),
+			returnInstruction: Type.Optional(Type.String({ description: "Optional instruction prepended to the automatic return message for the parent agent." })),
+			jobId: Type.Optional(Type.String({ description: "Job id for action=status/wait/cancel. Omit for action=status to list all jobs." })),
+			waitTimeoutSeconds: Type.Optional(Type.Number({ description: "Maximum time to wait for action=wait. If omitted, waits until completion or tool cancellation." })),
 		}),
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			if (signal?.aborted) return { content: [{ type: "text", text: "Cancelled before start" }], details: {} };
+			const action = params.action;
+			const returnToMain = Boolean(params.returnToMain);
+			const returnDelivery = (params.returnDelivery ?? "followUp") as ReturnDelivery;
+			const returnInstruction = params.returnInstruction as string | undefined;
 
-			await mkdir(LOG_DIR, { recursive: true });
+			if (action === "start") {
+				if (!params.command) throw new Error("bg_shell action=start requires command");
+				if (signal?.aborted) return { content: [{ type: "text", text: "Cancelled before start" }], details: {} };
 
-			const id = `bg_${String(nextJobNumber++).padStart(3, "0")}`;
-			const cwd = resolve(ctx.cwd, params.cwd ?? ".");
-			const logPath = join(LOG_DIR, `${id}-${timestampForFile()}.log`);
-			const log = createWriteStream(logPath, { flags: "a" });
-			const shell = process.env.SHELL || "/bin/bash";
-			const child = spawn(shell, ["-lc", params.command], {
-				cwd,
-				detached: true,
-				stdio: ["ignore", "pipe", "pipe"],
-				env: process.env,
-			});
+				await mkdir(LOG_DIR, { recursive: true });
 
-			const job: BackgroundJob = {
-				id,
-				command: params.command,
-				cwd,
-				label: params.label,
-				logPath,
-				child,
-				log,
-				startedAt: Date.now(),
-				status: "running",
-				exitCode: null,
-				signal: null,
-				tail: "",
-				waiters: [],
-			};
-			jobs.set(id, job);
-			monitor.update(ctx);
-
-			log.write(`$ cd ${shellQuote(cwd)} && ${params.command}\n\n`);
-			child.stdout.on("data", (data: Buffer) => {
-				if (!log.writableEnded && !log.destroyed) log.write(data);
-				appendTail(job, data);
-			});
-			child.stderr.on("data", (data: Buffer) => {
-				if (!log.writableEnded && !log.destroyed) log.write(data);
-				appendTail(job, data);
-			});
-			child.on("error", (error) => {
-				finishJob(job, "failed", null, null, error.message);
-				monitor.update(ctx);
-			});
-			child.on("close", (code, closeSignal) => {
-				const timedOut = job.status === "timed_out";
-				const cancelled = job.status === "cancelled";
-				if (timedOut || cancelled) return;
-				finishJob(job, code === 0 ? "exited" : "failed", code, closeSignal);
-				monitor.update(ctx);
-				try {
-					ctx.ui.notify(`Background job ${id} finished: ${job.status}${code === null ? "" : ` (${code})`}`, code === 0 ? "info" : "warning");
-				} catch {
-					// UI may no longer be available.
-				}
-			});
-
-			if (params.timeoutSeconds && params.timeoutSeconds > 0) {
-				job.timeout = setTimeout(() => {
-					finishJob(job, "timed_out", null, "SIGTERM", `Timed out after ${params.timeoutSeconds}s`);
-					monitor.update(ctx);
-					killProcessGroup(job, "SIGTERM");
-					setTimeout(() => killProcessGroup(job, "SIGKILL"), TERM_GRACE_MS);
-				}, params.timeoutSeconds * 1000);
-			}
-
-			return {
-				content: [{ type: "text", text: `Started background job ${id}\nCommand: ${params.command}\nCWD: ${cwd}\nLog: ${logPath}` }],
-				details: { id, command: params.command, cwd, logPath, status: "running" },
-			};
-		},
-	});
-
-	pi.registerTool({
-		name: "bg_shell_status",
-		label: "Background Shell Status",
-		description: "Check the status and recent output of one background shell job, or list all jobs if no jobId is provided.",
-		promptSnippet: "Check background shell job status and recent output",
-		parameters: Type.Object({
-			jobId: Type.Optional(Type.String({ description: "Job id returned by bg_shell_start. Omit to list all jobs." })),
-		}),
-		async execute(_toolCallId, params) {
-			if (!params.jobId) {
-				const lines = [...jobs.values()].map((job) => {
-					const elapsedUntil = job.endedAt ?? Date.now();
-					return `${job.id}\t${job.status}\t${formatDuration(elapsedUntil - job.startedAt)}\t${job.label ?? job.command}`;
+				const id = `bg_${String(nextJobNumber++).padStart(3, "0")}`;
+				const cwd = resolve(ctx.cwd, params.cwd ?? ".");
+				const logPath = join(LOG_DIR, `${id}-${timestampForFile()}.log`);
+				const log = createWriteStream(logPath, { flags: "a" });
+				const shell = process.env.SHELL || "/bin/bash";
+				const child = spawn(shell, ["-lc", params.command], {
+					cwd,
+					detached: true,
+					stdio: ["ignore", "pipe", "pipe"],
+					env: process.env,
 				});
-				return { content: [{ type: "text", text: lines.length ? lines.join("\n") : "No background jobs." }], details: { jobs: lines.length } };
+
+				const job: BackgroundJob = {
+					id,
+					command: params.command,
+					cwd,
+					label: params.label,
+					logPath,
+					child,
+					log,
+					startedAt: Date.now(),
+					status: "running",
+					exitCode: null,
+					signal: null,
+					tail: "",
+					waiters: [],
+				};
+				jobs.set(id, job);
+				monitor.update(ctx);
+
+				log.write(`$ cd ${shellQuote(cwd)} && ${params.command}\n\n`);
+				child.stdout.on("data", (data: Buffer) => {
+					if (!log.writableEnded && !log.destroyed) log.write(data);
+					appendTail(job, data);
+				});
+				child.stderr.on("data", (data: Buffer) => {
+					if (!log.writableEnded && !log.destroyed) log.write(data);
+					appendTail(job, data);
+				});
+				child.on("error", (error) => {
+					finishJob(job, "failed", null, null, error.message);
+					monitor.update(ctx);
+				});
+				child.on("close", (code, closeSignal) => {
+					const timedOut = job.status === "timed_out";
+					const cancelled = job.status === "cancelled";
+					if (timedOut || cancelled) return;
+					finishJob(job, code === 0 ? "exited" : "failed", code, closeSignal);
+					monitor.update(ctx);
+					try {
+						ctx.ui.notify(`Background job ${id} finished: ${job.status}${code === null ? "" : ` (${code})`}`, code === 0 ? "info" : "warning");
+					} catch {
+						// UI may no longer be available.
+					}
+				});
+
+				if (params.timeoutSeconds && params.timeoutSeconds > 0) {
+					job.timeout = setTimeout(() => {
+						finishJob(job, "timed_out", null, "SIGTERM", `Timed out after ${params.timeoutSeconds}s`);
+						monitor.update(ctx);
+						killProcessGroup(job, "SIGTERM");
+						setTimeout(() => killProcessGroup(job, "SIGKILL"), TERM_GRACE_MS);
+					}, params.timeoutSeconds * 1000);
+				}
+
+				if (returnToMain) scheduleReturnToMain(job, returnDelivery, returnInstruction);
+
+				return {
+					content: [{ type: "text", text: `Started background job ${id}${returnToMain ? " with automatic return to main agent" : ""}\nCommand: ${params.command}\nCWD: ${cwd}\nLog: ${logPath}` }],
+					details: { id, command: params.command, cwd, logPath, status: "running", returnsToMain: returnToMain },
+				};
 			}
 
-			const job = jobs.get(params.jobId);
-			if (!job) throw new Error(`Unknown background job: ${params.jobId}`);
-			return { content: [{ type: "text", text: summarizeJob(job) }], details: { id: job.id, status: job.status, exitCode: job.exitCode, logPath: job.logPath } };
-		},
-	});
+			if (action === "status") {
+				if (!params.jobId) {
+					const lines = [...jobs.values()].map((job) => {
+						const elapsedUntil = job.endedAt ?? Date.now();
+						return `${job.id}\t${job.status}\t${formatDuration(elapsedUntil - job.startedAt)}\t${job.label ?? job.command}`;
+					});
+					return { content: [{ type: "text", text: lines.length ? lines.join("\n") : "No background jobs." }], details: { jobs: lines.length } };
+				}
 
-	pi.registerTool({
-		name: "bg_shell_wait",
-		label: "Background Shell Wait",
-		description: "Wait for a background shell job to finish, then return its exit status and recent output. If waitTimeoutSeconds expires, the job keeps running.",
-		promptSnippet: "Wait for a background shell job to complete and return its result",
-		parameters: Type.Object({
-			jobId: Type.String({ description: "Job id returned by bg_shell_start." }),
-			waitTimeoutSeconds: Type.Optional(Type.Number({ description: "Maximum time to wait. If omitted, waits until completion or tool cancellation." })),
-		}),
-		async execute(_toolCallId, params, signal) {
-			const job = jobs.get(params.jobId);
-			if (!job) throw new Error(`Unknown background job: ${params.jobId}`);
+				const job = jobs.get(params.jobId);
+				if (!job) throw new Error(`Unknown background job: ${params.jobId}`);
+				return { content: [{ type: "text", text: summarizeJob(job) }], details: { id: job.id, status: job.status, exitCode: job.exitCode, logPath: job.logPath } };
+			}
 
-			const result = await waitForJob(job, params.waitTimeoutSeconds, signal);
-			if (result === "aborted") return { content: [{ type: "text", text: `Wait cancelled. Job ${job.id} is still ${job.status}.\nLog: ${job.logPath}` }], details: { id: job.id, status: job.status } };
-			if (result === "timeout") return { content: [{ type: "text", text: `Wait timed out. Job ${job.id} is still running.\n\n${summarizeJob(job)}` }], details: { id: job.id, status: job.status, logPath: job.logPath } };
+			if (action === "wait") {
+				if (!params.jobId) throw new Error("bg_shell action=wait requires jobId");
+				const job = jobs.get(params.jobId);
+				if (!job) throw new Error(`Unknown background job: ${params.jobId}`);
 
-			return { content: [{ type: "text", text: summarizeJob(job) }], details: { id: job.id, status: job.status, exitCode: job.exitCode, logPath: job.logPath } };
-		},
-	});
+				const result = await waitForJob(job, params.waitTimeoutSeconds, signal);
+				if (result === "aborted") return { content: [{ type: "text", text: `Wait cancelled. Job ${job.id} is still ${job.status}.\nLog: ${job.logPath}` }], details: { id: job.id, status: job.status } };
+				if (result === "timeout") return { content: [{ type: "text", text: `Wait timed out. Job ${job.id} is still running.\n\n${summarizeJob(job)}` }], details: { id: job.id, status: job.status, logPath: job.logPath } };
 
-	pi.registerTool({
-		name: "bg_shell_cancel",
-		label: "Background Shell Cancel",
-		description: "Terminate a running background shell job.",
-		promptSnippet: "Cancel a running background shell job",
-		parameters: Type.Object({
-			jobId: Type.String({ description: "Job id returned by bg_shell_start." }),
-		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const job = jobs.get(params.jobId);
-			if (!job) throw new Error(`Unknown background job: ${params.jobId}`);
-			if (job.status !== "running") return { content: [{ type: "text", text: `Job ${job.id} is already ${job.status}.` }], details: { id: job.id, status: job.status } };
+				return { content: [{ type: "text", text: summarizeJob(job) }], details: { id: job.id, status: job.status, exitCode: job.exitCode, logPath: job.logPath } };
+			}
 
-			finishJob(job, "cancelled", null, "SIGTERM", "Cancelled by bg_shell_cancel");
-			monitor.update(ctx);
-			killProcessGroup(job, "SIGTERM");
-			setTimeout(() => killProcessGroup(job, "SIGKILL"), TERM_GRACE_MS);
-			return { content: [{ type: "text", text: `Cancelled background job ${job.id}.\nLog: ${job.logPath}` }], details: { id: job.id, status: job.status, logPath: job.logPath } };
+			if (action === "cancel") {
+				if (!params.jobId) throw new Error("bg_shell action=cancel requires jobId");
+				const job = jobs.get(params.jobId);
+				if (!job) throw new Error(`Unknown background job: ${params.jobId}`);
+				if (job.status !== "running") return { content: [{ type: "text", text: `Job ${job.id} is already ${job.status}.` }], details: { id: job.id, status: job.status } };
+
+				finishJob(job, "cancelled", null, "SIGTERM", "Cancelled by bg_shell cancel");
+				monitor.update(ctx);
+				killProcessGroup(job, "SIGTERM");
+				setTimeout(() => killProcessGroup(job, "SIGKILL"), TERM_GRACE_MS);
+				return { content: [{ type: "text", text: `Cancelled background job ${job.id}.\nLog: ${job.logPath}` }], details: { id: job.id, status: job.status, logPath: job.logPath } };
+			}
+
+			throw new Error(`Unsupported bg_shell action: ${action}`);
 		},
 	});
 
 	pi.on("session_shutdown", async () => {
+		shuttingDown = true;
 		for (const job of jobs.values()) {
 			if (job.status !== "running") continue;
 			finishJob(job, "cancelled", null, "SIGTERM", "Cancelled by session shutdown");
