@@ -139,11 +139,14 @@ class SideChatComponent implements Component, Focusable {
 	private followBottom = true;
 	private lastBodyLength = 0;
 
+	private closed = false;
+	private currentAbortController?: AbortController;
+
 	constructor(
 		private readonly tui: TuiLike,
 		private readonly theme: Theme,
 		private readonly done: () => void,
-		private readonly onSend: (text: string) => Promise<string>,
+		private readonly onSend: (text: string, signal: AbortSignal) => Promise<string>,
 		initialQuestion?: string,
 	) {
 		if (initialQuestion?.trim()) {
@@ -151,8 +154,17 @@ class SideChatComponent implements Component, Focusable {
 		}
 	}
 
+	private close(): void {
+		if (this.closed) return;
+		this.closed = true;
+		this.currentAbortController?.abort();
+		this.done();
+	}
+
 	private async send(text: string): Promise<void> {
-		if (this.busy || !text.trim()) return;
+		if (this.closed || this.busy || !text.trim()) return;
+		const abortController = new AbortController();
+		this.currentAbortController = abortController;
 		this.input = "";
 		this.error = undefined;
 		this.busy = true;
@@ -160,20 +172,25 @@ class SideChatComponent implements Component, Focusable {
 		this.tui.requestRender();
 
 		try {
-			const answer = await this.onSend(text);
+			const answer = await this.onSend(text, abortController.signal);
+			if (this.closed || abortController.signal.aborted) return;
 			this.messages.push({ role: "assistant", text: answer.trim() || "(empty response)" });
 		} catch (error) {
+			if (this.closed || abortController.signal.aborted) return;
 			this.error = error instanceof Error ? error.message : String(error);
 			this.messages.push({ role: "system", text: `Error: ${this.error}` });
 		} finally {
-			this.busy = false;
-			this.tui.requestRender();
+			if (this.currentAbortController === abortController) this.currentAbortController = undefined;
+			if (!this.closed) {
+				this.busy = false;
+				this.tui.requestRender();
+			}
 		}
 	}
 
 	handleInput(data: string): void {
 		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
-			this.done();
+			this.close();
 			return;
 		}
 		if (matchesKey(data, "up")) {
@@ -206,7 +223,7 @@ class SideChatComponent implements Component, Focusable {
 		if (matchesKey(data, "enter")) {
 			const text = this.input.trim();
 			if (["exit", "quit", "/exit", "/quit"].includes(text.toLowerCase())) {
-				this.done();
+				this.close();
 				return;
 			}
 			void this.send(text);
@@ -356,7 +373,7 @@ async function openSideChat(args: string, ctx: ExtensionCommandContext): Promise
 
 	await ctx.ui.custom<void>(
 		(tui, theme, _keybindings, done) => {
-			const send = async (text: string) => {
+			const send = async (text: string, signal: AbortSignal) => {
 				const progress = formatMainToolProgress();
 				const userMessage: UserMessage = {
 					role: "user",
@@ -368,7 +385,7 @@ async function openSideChat(args: string, ctx: ExtensionCommandContext): Promise
 				const response = await complete(
 					model,
 					{ systemPrompt: SYSTEM_PROMPT, messages },
-					{ apiKey: auth.apiKey, headers: auth.headers },
+					{ apiKey: auth.apiKey, headers: auth.headers, signal },
 				);
 
 				const answer = response.content
