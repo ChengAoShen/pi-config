@@ -29,11 +29,10 @@ The goal is simple: open Pi and work. Long commands can run in the background, i
 ## ✨ Highlights
 
 - 🦥 **Personal-first defaults** — simple command aliases such as `exit → /quit` and `clear → /new`.
-- 🚫 **No permission gate** — no extra local confirmation layer for bash commands; Pi behaves directly and predictably.
 - 🧵 **Background shell jobs** — start long-running commands, inspect logs, wait for completion, or cancel without blocking the main agent loop.
-- 🤖 **Headless sub-agents** — launch read-only Pi workers in parallel for research, review, planning, and test analysis.
+- 🤖 **Simple headless sub-agents** — launch read-only Pi workers in parallel for research, review, planning, and test analysis.
 - 💬 **Ephemeral side chat** — `/side` and `/btw` open a lightweight no-tools overlay for explanations and side questions.
-- 📦 **Portable config** — clone into `~/.pi`, install packages, log in locally, and keep machine-specific data private.
+- 📦 **Portable config** — clone into `~/.pi`, install extension packages, log in locally, and restore the working environment.
 
 ---
 
@@ -104,7 +103,7 @@ PageUp/PageDown   fast scroll
 Home / End        jump
 ```
 
-The side chat is intentionally tool-less: it explains, clarifies, and thinks with you, but it does not execute commands or modify files.
+The side chat is tool-less: it explains, clarifies, and thinks with you, but it does not execute commands or modify files.
 
 ---
 
@@ -116,35 +115,11 @@ Install Pi first, then clone this repository as your Pi config directory:
 git clone https://github.com/ChengAoShen/LazyPi.git ~/.pi
 ```
 
-Start Pi once, or reconcile extension packages explicitly:
+Start Pi once, or sync extension packages explicitly:
 
 ```bash
 pi update --extensions
 ```
-
-If packages are not installed automatically, install the required package manually:
-
-```bash
-pi install npm:pi-web-access
-```
-
-Then configure credentials on that machine separately with `pi login`, `/login`, or environment variables.
-
----
-
-## 🔒 What is not committed
-
-LazyPi intentionally excludes local and sensitive data:
-
-| Path | Reason |
-| --- | --- |
-| `agent/auth.json` | Credentials and login data. |
-| `agent/sessions/` | Conversation history. |
-| `agent/npm/` | Installed package cache and `node_modules`. |
-| `agent/bin/` | Local binaries. |
-| `agent/tmp/` | Runtime logs, prompts, and temporary job output. |
-
-> This repository can contain personal workflow preferences and local extensions with full system access. Treat it as a personal config repo unless you have reviewed everything carefully.
 
 ---
 
