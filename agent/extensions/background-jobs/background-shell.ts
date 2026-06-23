@@ -11,7 +11,7 @@ import { mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { appendTail as appendTailText, formatDuration, RESULT_LIMIT_BYTES, shellQuote, timestampForFile, truncateTail } from "../shared/shell.ts";
 import type { createJobsMonitor } from "./job-monitor.ts";
@@ -21,6 +21,32 @@ const TERM_GRACE_MS = 3000;
 
 type JobStatus = "running" | "exited" | "failed" | "timed_out" | "cancelled";
 type ReturnDelivery = "steer" | "followUp" | "nextTurn";
+
+type BackgroundShellConfig = {
+	defaultTimeoutSeconds?: number;
+	defaultWaitTimeoutSeconds?: number;
+	defaultReturnToMain: boolean;
+	defaultReturnDelivery: ReturnDelivery;
+};
+
+const shellConfig: BackgroundShellConfig = {
+	defaultReturnToMain: false,
+	defaultReturnDelivery: "followUp",
+};
+
+function positiveNumber(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+function formatConfig(config: BackgroundShellConfig): string {
+	return [
+		"Background shell configuration:",
+		`defaultTimeoutSeconds: ${config.defaultTimeoutSeconds ?? "none"}`,
+		`defaultWaitTimeoutSeconds: ${config.defaultWaitTimeoutSeconds ?? "none"}`,
+		`defaultReturnToMain: ${config.defaultReturnToMain}`,
+		`defaultReturnDelivery: ${config.defaultReturnDelivery}`,
+	].join("\n");
+}
 
 type BackgroundJob = {
 	id: string;
@@ -131,18 +157,43 @@ export function installBackgroundShell(pi: ExtensionAPI, jobsMonitor: JobsMonito
 	let nextJobNumber = 1;
 	let shuttingDown = false;
 	const jobs = new Map<string, BackgroundJob>();
+	function cancelJob(id: string, ctx?: ExtensionContext): boolean {
+		const job = jobs.get(id);
+		if (!job || job.status !== "running") return false;
+		finishJob(job, "cancelled", null, "SIGTERM", "Cancelled by background jobs UI");
+		monitor.update(ctx);
+		killProcessGroup(job, "SIGTERM");
+		setTimeout(() => killProcessGroup(job, "SIGKILL"), TERM_GRACE_MS);
+		return true;
+	}
+
 	const monitor = jobsMonitor.registerSource({
 		id: "shell",
-		title: "shell jobs",
-		emptyText: "no shell jobs",
+		title: "shell",
 		getJobs: () => [...jobs.values()].map((job) => ({
 			id: job.id,
 			status: job.status,
 			startedAt: job.startedAt,
 			endedAt: job.endedAt,
 			label: job.label ?? job.command,
+			cwd: job.cwd,
+			logPath: job.logPath,
 			tail: job.tail,
+			canCancel: job.status === "running",
 		})),
+		getJobDetails: (id) => {
+			const job = jobs.get(id);
+			if (!job) return [`unknown shell job: ${id}`];
+			return [
+				`command: ${job.command}`,
+				`cwd: ${job.cwd}`,
+				`log: ${job.logPath}`,
+				`exit: ${job.exitCode ?? "n/a"}`,
+				`signal: ${job.signal ?? "n/a"}`,
+				...(job.error ? [`error: ${job.error}`] : []),
+			];
+		},
+		cancelJob,
 	});
 
 	function returnShellResultToMain(job: BackgroundJob, delivery: ReturnDelivery, instruction?: string): void {
@@ -169,7 +220,7 @@ export function installBackgroundShell(pi: ExtensionAPI, jobsMonitor: JobsMonito
 	pi.registerTool({
 		name: "bg_shell",
 		label: "Background Shell",
-		description: "Manage non-interactive shell commands as background jobs. Use action=start for long-running commands; set returnToMain=true to automatically send the completed result back to the main agent. Use action=status to inspect jobs, action=wait to wait, and action=cancel to terminate a running job.",
+		description: "Manage non-interactive shell commands as background jobs. Use action=start for long-running commands; set returnToMain=true to automatically send the completed result back to the main agent. Use action=status to inspect jobs, action=wait to wait, action=cancel to terminate a running job, and action=config to inspect or update session defaults.",
 		promptSnippet: "Start, inspect, wait for, or cancel long-running shell commands as background jobs",
 		promptGuidelines: [
 			"Use bg_shell action=start for long-running commands such as builds, tests, dev servers, migrations, downloads, or commands expected to take more than about 10 seconds.",
@@ -178,7 +229,7 @@ export function installBackgroundShell(pi: ExtensionAPI, jobsMonitor: JobsMonito
 			"Do not use bg_shell action=start for commands that require interactive stdin.",
 		],
 		parameters: Type.Object({
-			action: StringEnum(["start", "status", "wait", "cancel"] as const),
+			action: StringEnum(["start", "status", "wait", "cancel", "config"] as const),
 			command: Type.Optional(Type.String({ description: "Shell command to run for action=start." })),
 			cwd: Type.Optional(Type.String({ description: "Working directory for action=start. Relative paths are resolved against the current cwd." })),
 			timeoutSeconds: Type.Optional(Type.Number({ description: "Optional maximum runtime for action=start. If exceeded, the job is terminated and marked timed_out." })),
@@ -187,13 +238,25 @@ export function installBackgroundShell(pi: ExtensionAPI, jobsMonitor: JobsMonito
 			returnDelivery: Type.Optional(StringEnum(["steer", "followUp", "nextTurn"] as const, { description: "Delivery mode when returnToMain=true. Default: followUp." })),
 			returnInstruction: Type.Optional(Type.String({ description: "Optional instruction prepended to the automatic return message for the parent agent." })),
 			jobId: Type.Optional(Type.String({ description: "Job id for action=status/wait/cancel. Omit for action=status to list all jobs." })),
-			waitTimeoutSeconds: Type.Optional(Type.Number({ description: "Maximum time to wait for action=wait. If omitted, waits until completion or tool cancellation." })),
+			waitTimeoutSeconds: Type.Optional(Type.Number({ description: "Maximum time to wait for action=wait. If omitted, uses configured default or waits until completion/tool cancellation." })),
+			defaultTimeoutSeconds: Type.Optional(Type.Number({ description: "For action=config: set default maximum runtime for future start calls. Use <=0 to clear." })),
+			defaultWaitTimeoutSeconds: Type.Optional(Type.Number({ description: "For action=config: set default maximum wait time for future wait calls. Use <=0 to clear." })),
+			defaultReturnToMain: Type.Optional(Type.Boolean({ description: "For action=config: default returnToMain for future start calls." })),
+			defaultReturnDelivery: Type.Optional(StringEnum(["steer", "followUp", "nextTurn"] as const, { description: "For action=config: default delivery mode when automatic return is enabled." })),
 		}),
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const action = params.action;
-			const returnToMain = Boolean(params.returnToMain);
-			const returnDelivery = (params.returnDelivery ?? "followUp") as ReturnDelivery;
+			const returnToMain = params.returnToMain ?? shellConfig.defaultReturnToMain;
+			const returnDelivery = (params.returnDelivery ?? shellConfig.defaultReturnDelivery) as ReturnDelivery;
 			const returnInstruction = params.returnInstruction as string | undefined;
+
+			if (action === "config") {
+				if ("defaultTimeoutSeconds" in params) shellConfig.defaultTimeoutSeconds = positiveNumber(params.defaultTimeoutSeconds);
+				if ("defaultWaitTimeoutSeconds" in params) shellConfig.defaultWaitTimeoutSeconds = positiveNumber(params.defaultWaitTimeoutSeconds);
+				if (typeof params.defaultReturnToMain === "boolean") shellConfig.defaultReturnToMain = params.defaultReturnToMain;
+				if (params.defaultReturnDelivery) shellConfig.defaultReturnDelivery = params.defaultReturnDelivery as ReturnDelivery;
+				return { content: [{ type: "text", text: formatConfig(shellConfig) }], details: { ...shellConfig } };
+			}
 
 			if (action === "start") {
 				if (!params.command) throw new Error("bg_shell action=start requires command");
@@ -257,20 +320,21 @@ export function installBackgroundShell(pi: ExtensionAPI, jobsMonitor: JobsMonito
 					}
 				});
 
-				if (params.timeoutSeconds && params.timeoutSeconds > 0) {
+				const timeoutSeconds = positiveNumber(params.timeoutSeconds) ?? shellConfig.defaultTimeoutSeconds;
+				if (timeoutSeconds) {
 					job.timeout = setTimeout(() => {
-						finishJob(job, "timed_out", null, "SIGTERM", `Timed out after ${params.timeoutSeconds}s`);
+						finishJob(job, "timed_out", null, "SIGTERM", `Timed out after ${timeoutSeconds}s`);
 						monitor.update(ctx);
 						killProcessGroup(job, "SIGTERM");
 						setTimeout(() => killProcessGroup(job, "SIGKILL"), TERM_GRACE_MS);
-					}, params.timeoutSeconds * 1000);
+					}, timeoutSeconds * 1000);
 				}
 
 				if (returnToMain) scheduleReturnToMain(job, returnDelivery, returnInstruction);
 
 				return {
-					content: [{ type: "text", text: `Started background job ${id}${returnToMain ? " with automatic return to main agent" : ""}\nCommand: ${params.command}\nCWD: ${cwd}\nLog: ${logPath}` }],
-					details: { id, command: params.command, cwd, logPath, status: "running", returnsToMain: returnToMain },
+					content: [{ type: "text", text: `Started background job ${id}${returnToMain ? " with automatic return to main agent" : ""}\nCommand: ${params.command}\nCWD: ${cwd}\nLog: ${logPath}${timeoutSeconds ? `\nTimeout: ${timeoutSeconds}s` : ""}` }],
+					details: { id, command: params.command, cwd, logPath, status: "running", returnsToMain: returnToMain, timeoutSeconds },
 				};
 			}
 
@@ -293,7 +357,8 @@ export function installBackgroundShell(pi: ExtensionAPI, jobsMonitor: JobsMonito
 				const job = jobs.get(params.jobId);
 				if (!job) throw new Error(`Unknown background job: ${params.jobId}`);
 
-				const result = await waitForJob(job, params.waitTimeoutSeconds, signal);
+				const waitTimeoutSeconds = positiveNumber(params.waitTimeoutSeconds) ?? shellConfig.defaultWaitTimeoutSeconds;
+				const result = await waitForJob(job, waitTimeoutSeconds, signal);
 				if (result === "aborted") return { content: [{ type: "text", text: `Wait cancelled. Job ${job.id} is still ${job.status}.\nLog: ${job.logPath}` }], details: { id: job.id, status: job.status } };
 				if (result === "timeout") return { content: [{ type: "text", text: `Wait timed out. Job ${job.id} is still running.\n\n${summarizeJob(job)}` }], details: { id: job.id, status: job.status, logPath: job.logPath } };
 
@@ -306,10 +371,7 @@ export function installBackgroundShell(pi: ExtensionAPI, jobsMonitor: JobsMonito
 				if (!job) throw new Error(`Unknown background job: ${params.jobId}`);
 				if (job.status !== "running") return { content: [{ type: "text", text: `Job ${job.id} is already ${job.status}.` }], details: { id: job.id, status: job.status } };
 
-				finishJob(job, "cancelled", null, "SIGTERM", "Cancelled by bg_shell cancel");
-				monitor.update(ctx);
-				killProcessGroup(job, "SIGTERM");
-				setTimeout(() => killProcessGroup(job, "SIGKILL"), TERM_GRACE_MS);
+				cancelJob(job.id, ctx);
 				return { content: [{ type: "text", text: `Cancelled background job ${job.id}.\nLog: ${job.logPath}` }], details: { id: job.id, status: job.status, logPath: job.logPath } };
 			}
 

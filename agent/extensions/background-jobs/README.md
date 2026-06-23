@@ -1,30 +1,76 @@
 # Background Jobs
 
-A bundled Pi extension for background execution used by the main agent.
+A Pi extension for agent-facing background execution and a small keyboard-first `/jobs` monitor.
 
 ## Responsibilities
 
-- `background-shell.ts`: long-running non-interactive shell commands via the unified `bg_shell` tool.
-- `sub-agents.ts`: headless Pi workers via the `sub_agent` tool. One unified `start` action handles single and parallel tasks; `returnToMain` can send results back automatically.
-- `job-monitor.ts`: shared footer status and focused right-side jobs overlay.
-- `index.ts`: plugin entry point.
+- `background-shell.ts`: `bg_shell` for long-running non-interactive shell commands.
+- `sub-agents.ts`: `sub_agent` for headless read-mostly Pi workers.
+- `job-monitor.ts`: source aggregation, footer status, and `/jobs` command routing.
+- `jobs-overlay.ts`: focused centered floating background job list UI.
+- `types.ts`: shared monitor/source types.
+- `index.ts`: extension entry point.
 
-## Design
+The extension intentionally does not modify Pi core, Pi TUI, mouse behavior, assistant message rendering, or the main conversation panel.
 
-The tools are agent-facing infrastructure. Users should normally ask the main agent for an outcome, while the main agent starts, waits for, checks, and cancels background work as needed. For detached work that should resume the main agent automatically, use `sub_agent` or `bg_shell` with `action: "start"` and `returnToMain: true`.
+## Agent-facing tools
 
-The user-facing UI is observational:
+Both `bg_shell` and `sub_agent` support:
 
-```text
-/jobs          open/toggle all background work
-/jobs shell    show shell jobs
-/jobs agents   show sub-agent jobs
-/jobs failed   show failed/timed-out jobs
-/jobs close    close the jobs overlay
-/jobs clear    acknowledge failed/timed-out footer warnings
+- `action: "start"`
+- `action: "status"`
+- `action: "wait"`
+- `action: "cancel"`
+- `action: "config"`
+
+For detached work that should resume the main agent automatically, start with `returnToMain: true`.
+
+Example config:
+
+```json
+{
+  "action": "config",
+  "defaultTimeoutSeconds": 600,
+  "defaultWaitTimeoutSeconds": 30,
+  "defaultReturnToMain": true,
+  "defaultReturnDelivery": "followUp"
+}
 ```
 
-Inside the overlay, `Esc`/`q` closes it, `↑↓` scrolls, and `a/s/g/f` switches filters.
+`sub_agent` additionally supports `defaultThinking`.
+
+## User-facing UI
+
+`/jobs` opens a centered floating window, not a side panel.
+
+```text
+/jobs           open/toggle all background work
+/jobs all       show all jobs
+/jobs shell     show shell jobs
+/jobs agents    show sub-agent jobs
+/jobs running   show running jobs
+/jobs exited    show exited/cancelled jobs
+/jobs failed    show failed/timed-out jobs
+/jobs close     close the jobs overlay
+/jobs clear     acknowledge failed/timed-out footer warnings
+```
+
+### Keys inside `/jobs`
+
+```text
+j/k or ↑↓        move selection
+ctrl+u/ctrl+d    page up/down
+g/G              top/bottom
+enter/space/o    expand current job
+O                expand/collapse visible jobs
+x                cancel selected running job
+l                show selected log path
+c                acknowledge failed footer warning
+a/s/n/r/e/f      filters
+R                refresh
+?                help
+q/esc            close
+```
 
 The footer uses one aggregate status key:
 
@@ -35,3 +81,7 @@ The footer uses one aggregate status key:
 ```
 
 Running jobs are cancelled on `session_shutdown` by their owning module.
+
+## Design notes
+
+`/jobs` is intentionally limited to background work (`bg_shell` and `sub_agent`). Inline activity rendering lives in `ui-optimize/` so the monitor does not grow into a general conversation navigator.

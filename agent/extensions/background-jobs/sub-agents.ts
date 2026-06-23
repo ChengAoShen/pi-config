@@ -12,7 +12,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { appendTail as appendTailText, formatDuration, RESULT_LIMIT_BYTES, timestampForFile, truncateTail } from "../shared/shell.ts";
 import type { createJobsMonitor } from "./job-monitor.ts";
@@ -25,9 +25,38 @@ const DEFAULT_TOOLS = ["read", "grep", "find", "ls"];
 const DEFAULT_THINKING = "medium";
 
 type AgentStatus = "running" | "exited" | "failed" | "timed_out" | "cancelled";
-type Action = "start" | "status" | "wait" | "cancel";
+type Action = "start" | "status" | "wait" | "cancel" | "config";
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 type ReturnDelivery = "steer" | "followUp" | "nextTurn";
+
+type SubAgentConfig = {
+	defaultTimeoutSeconds?: number;
+	defaultWaitTimeoutSeconds?: number;
+	defaultReturnToMain: boolean;
+	defaultReturnDelivery: ReturnDelivery;
+	defaultThinking: ThinkingLevel;
+};
+
+const subAgentConfig: SubAgentConfig = {
+	defaultReturnToMain: false,
+	defaultReturnDelivery: "followUp",
+	defaultThinking: DEFAULT_THINKING,
+};
+
+function positiveNumber(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+function formatConfig(config: SubAgentConfig): string {
+	return [
+		"Sub-agent configuration:",
+		`defaultTimeoutSeconds: ${config.defaultTimeoutSeconds ?? "none"}`,
+		`defaultWaitTimeoutSeconds: ${config.defaultWaitTimeoutSeconds ?? "none"}`,
+		`defaultReturnToMain: ${config.defaultReturnToMain}`,
+		`defaultReturnDelivery: ${config.defaultReturnDelivery}`,
+		`defaultThinking: ${config.defaultThinking}`,
+	].join("\n");
+}
 
 type MainToolProgress = {
 	id: string;
@@ -277,18 +306,47 @@ export function installSubAgents(pi: ExtensionAPI, jobsMonitor: JobsMonitor) {
 	let nextAgentNumber = 1;
 	let shuttingDown = false;
 	const jobs = new Map<string, SubAgentJob>();
+	function cancelJob(id: string, ctx?: ExtensionContext): boolean {
+		const job = jobs.get(id);
+		if (!job || job.status !== "running") return false;
+		finishJob(job, "cancelled", null, "SIGTERM", "Cancelled by background jobs UI");
+		monitor.update(ctx);
+		killProcessGroup(job, "SIGTERM");
+		setTimeout(() => killProcessGroup(job, "SIGKILL"), TERM_GRACE_MS);
+		return true;
+	}
+
 	const monitor = jobsMonitor.registerSource({
 		id: "agents",
-		title: "sub-agent jobs",
-		emptyText: "no sub-agent jobs",
+		title: "agents",
 		getJobs: () => [...jobs.values()].map((job) => ({
 			id: job.id,
 			status: job.status,
 			startedAt: job.startedAt,
 			endedAt: job.endedAt,
 			label: job.label ?? job.role ?? job.task,
+			cwd: job.cwd,
+			logPath: job.logPath,
 			tail: job.tail,
+			canCancel: job.status === "running",
 		})),
+		getJobDetails: (id) => {
+			const job = jobs.get(id);
+			if (!job) return [`unknown agent job: ${id}`];
+			return [
+				`role: ${job.role ?? "general"}`,
+				`cwd: ${job.cwd}`,
+				`tools: ${job.tools.join(",")}`,
+				`model: ${job.model ?? "default"}`,
+				`thinking: ${job.thinking}`,
+				`prompt: ${job.promptPath}`,
+				`log: ${job.logPath}`,
+				`exit: ${job.exitCode ?? "n/a"}`,
+				`signal: ${job.signal ?? "n/a"}`,
+				...(job.error ? [`error: ${job.error}`] : []),
+			];
+		},
+		cancelJob,
 	});
 
 	pi.on("agent_start", async () => {
@@ -481,7 +539,7 @@ export function installSubAgents(pi: ExtensionAPI, jobsMonitor: JobsMonitor) {
 			"Sub-agents run with --no-extensions, so they cannot recursively create more sub-agents.",
 		],
 		parameters: Type.Object({
-			action: StringEnum(["start", "status", "wait", "cancel"] as const),
+			action: StringEnum(["start", "status", "wait", "cancel", "config"] as const),
 			task: Type.Optional(Type.String({ description: "Single task for action=start. Mutually exclusive with tasks." })),
 			role: Type.Optional(Type.String({ description: "Optional role for action=start." })),
 			label: Type.Optional(Type.String({ description: "Optional label for action=start." })),
@@ -498,19 +556,40 @@ export function installSubAgents(pi: ExtensionAPI, jobsMonitor: JobsMonitor) {
 			jobId: Type.Optional(Type.String({ description: "Single sub-agent id for status/wait/cancel." })),
 			jobIds: Type.Optional(Type.Array(Type.String(), { description: "Multiple sub-agent ids for status/wait/cancel. Omit jobId/jobIds to target all jobs." })),
 			waitTimeoutSeconds: Type.Optional(Type.Number({ description: "Maximum time to wait for action=wait. If it expires, running sub-agents continue." })),
+			defaultTimeoutSeconds: Type.Optional(Type.Number({ description: "For action=config: set default maximum runtime for future sub-agents. Use <=0 to clear." })),
+			defaultWaitTimeoutSeconds: Type.Optional(Type.Number({ description: "For action=config: set default maximum wait time for future wait calls. Use <=0 to clear." })),
+			defaultReturnToMain: Type.Optional(Type.Boolean({ description: "For action=config: default returnToMain for future start calls." })),
+			defaultReturnDelivery: Type.Optional(StringEnum(["steer", "followUp", "nextTurn"] as const, { description: "For action=config: default delivery mode when automatic return is enabled." })),
+			defaultThinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"] as const, { description: "For action=config: default sub-agent thinking level." })),
 		}),
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const action = params.action as Action;
-			const returnToMain = Boolean(params.returnToMain);
-			const returnDelivery = (params.returnDelivery ?? "followUp") as ReturnDelivery;
+			const returnToMain = params.returnToMain ?? subAgentConfig.defaultReturnToMain;
+			const returnDelivery = (params.returnDelivery ?? subAgentConfig.defaultReturnDelivery) as ReturnDelivery;
 			const returnInstruction = params.returnInstruction as string | undefined;
+
+			if (action === "config") {
+				if ("defaultTimeoutSeconds" in params) subAgentConfig.defaultTimeoutSeconds = positiveNumber(params.defaultTimeoutSeconds);
+				if ("defaultWaitTimeoutSeconds" in params) subAgentConfig.defaultWaitTimeoutSeconds = positiveNumber(params.defaultWaitTimeoutSeconds);
+				if (typeof params.defaultReturnToMain === "boolean") subAgentConfig.defaultReturnToMain = params.defaultReturnToMain;
+				if (params.defaultReturnDelivery) subAgentConfig.defaultReturnDelivery = params.defaultReturnDelivery as ReturnDelivery;
+				if (params.defaultThinking) subAgentConfig.defaultThinking = params.defaultThinking as ThinkingLevel;
+				return { content: [{ type: "text", text: formatConfig(subAgentConfig) }], details: { ...subAgentConfig } };
+			}
 
 			if (action === "start") {
 				const hasSingle = Boolean(params.task);
 				const hasTasks = Boolean(params.tasks?.length);
 				if (hasSingle === hasTasks) throw new Error("sub_agent action=start requires exactly one of task or tasks");
 
-				const tasks = hasTasks ? (params.tasks as AgentTask[]) : [params as AgentTask];
+				const commonTimeoutSeconds = positiveNumber(params.timeoutSeconds) ?? subAgentConfig.defaultTimeoutSeconds;
+				const commonThinking = (params.thinking ?? subAgentConfig.defaultThinking) as ThinkingLevel;
+				const rawTasks = hasTasks ? (params.tasks as AgentTask[]) : [params as AgentTask];
+				const tasks = rawTasks.map((task) => ({
+					...task,
+					thinking: task.thinking ?? commonThinking,
+					timeoutSeconds: positiveNumber(task.timeoutSeconds) ?? commonTimeoutSeconds,
+				}));
 				if (tasks.length > MAX_START_MANY) throw new Error(`sub_agent action=start supports at most ${MAX_START_MANY} tasks`);
 				const running = [...jobs.values()].filter((job) => job.status === "running").length;
 				if (running + tasks.length > MAX_START_MANY) {
@@ -551,7 +630,8 @@ export function installSubAgents(pi: ExtensionAPI, jobsMonitor: JobsMonitor) {
 				const knownJobs = ids.map((id) => jobs.get(id)).filter((job): job is SubAgentJob => Boolean(job));
 				if (!knownJobs.length) throw new Error(`No known sub-agents found: ${ids.join(", ")}`);
 
-				const deadline = params.waitTimeoutSeconds && params.waitTimeoutSeconds > 0 ? Date.now() + params.waitTimeoutSeconds * 1000 : undefined;
+				const waitTimeoutSeconds = positiveNumber(params.waitTimeoutSeconds) ?? subAgentConfig.defaultWaitTimeoutSeconds;
+				const deadline = waitTimeoutSeconds ? Date.now() + waitTimeoutSeconds * 1000 : undefined;
 				for (const job of knownJobs) {
 					const remaining = deadline ? Math.max(0.001, (deadline - Date.now()) / 1000) : undefined;
 					const result = await waitForJob(job, remaining, signal);
@@ -577,10 +657,7 @@ export function installSubAgents(pi: ExtensionAPI, jobsMonitor: JobsMonitor) {
 						lines.push(`${job.id} already ${job.status}`);
 						continue;
 					}
-					finishJob(job, "cancelled", null, "SIGTERM", "Cancelled by sub_agent cancel");
-					monitor.update(ctx);
-					killProcessGroup(job, "SIGTERM");
-					setTimeout(() => killProcessGroup(job, "SIGKILL"), TERM_GRACE_MS);
+					cancelJob(job.id, ctx);
 					lines.push(`${job.id} cancelled`);
 				}
 				return { content: [{ type: "text", text: lines.join("\n") }], details: { ids } };
