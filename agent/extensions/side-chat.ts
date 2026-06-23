@@ -7,7 +7,9 @@
 
 import { complete, type AssistantMessage, type UserMessage } from "@earendil-works/pi-ai";
 import { getMarkdownTheme, type ExtensionAPI, type ExtensionCommandContext, type Theme } from "@earendil-works/pi-coding-agent";
-import { CURSOR_MARKER, Markdown, matchesKey, truncateToWidth, wrapTextWithAnsi, type Component, type Focusable } from "@earendil-works/pi-tui";
+import { CURSOR_MARKER, Markdown, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type Focusable } from "@earendil-works/pi-tui";
+
+import { CENTER_FLOATING_OVERLAY, FLOATING_WINDOW_BODY_LINES, renderFloatingWindow } from "./shared/floating-window.ts";
 
 type ChatRole = "user" | "assistant" | "system";
 
@@ -269,7 +271,7 @@ class SideChatComponent implements Component, Focusable {
 	}
 
 	private bodyViewportLines(): number {
-		return 20;
+		return FLOATING_WINDOW_BODY_LINES;
 	}
 
 	private buildBody(innerWidth: number): string[] {
@@ -302,12 +304,7 @@ class SideChatComponent implements Component, Focusable {
 	}
 
 	render(width: number): string[] {
-		const divider = this.theme.fg("borderMuted", "│");
-		const contentWidth = Math.max(20, width - 2);
-		const rule = this.theme.fg("borderMuted", "─".repeat(Math.max(0, contentWidth)));
-		const lines: string[] = [];
-		const line = (content: string) => truncateToWidth(`${divider} ${content}`, width);
-
+		const contentWidth = Math.max(20, width - 4);
 		const body = this.buildBody(contentWidth);
 		const viewportLines = this.bodyViewportLines();
 		this.lastBodyLength = body.length;
@@ -315,23 +312,26 @@ class SideChatComponent implements Component, Focusable {
 		if (this.followBottom) this.scrollTop = maxTop;
 		this.scrollTop = Math.max(0, Math.min(maxTop, this.scrollTop));
 
-		const range = body.length > viewportLines ? ` · ${this.scrollTop + 1}-${Math.min(body.length, this.scrollTop + viewportLines)}/${body.length}` : "";
+		const range = body.length > viewportLines ? `${this.scrollTop + 1}-${Math.min(body.length, this.scrollTop + viewportLines)}/${body.length}` : "";
 		const status = this.busy ? "thinking" : "no tools";
-		lines.push(line(`${this.theme.fg("accent", "✦ side")} ${this.theme.fg("dim", `${status} · ↑↓ scroll · esc close${range}`)}`));
-		lines.push(line(rule));
-
 		const visibleBody = body.slice(this.scrollTop, this.scrollTop + viewportLines);
 		while (visibleBody.length < viewportLines) visibleBody.push("");
-		for (const bodyLine of visibleBody) {
-			lines.push(line(bodyLine));
-		}
 
-		lines.push(line(rule));
-		const prompt = this.busy ? this.theme.fg("dim", "waiting for response…") : `${this.theme.fg("accent", "›")} ${this.input}${this.focused ? CURSOR_MARKER : ""}`;
-		for (const promptLine of wrapTextWithAnsi(prompt, contentWidth)) {
-			lines.push(line(promptLine));
-		}
-		return lines;
+		const hint = this.theme.fg("dim", "enter send · ↑↓ scroll · esc close");
+		const promptWidth = Math.max(1, contentWidth - visibleWidth(hint) - 4);
+		const prompt = this.busy
+			? this.theme.fg("dim", "waiting for response…")
+			: `${this.theme.fg("accent", "›")} ${truncateToWidth(this.input, promptWidth, "…")}${this.focused ? CURSOR_MARKER : ""}`;
+		const footer = `${prompt}  ${hint}`;
+
+		return renderFloatingWindow({
+			theme: this.theme,
+			width,
+			title: "side chat",
+			subtitle: range ? `${status} · ${range}` : status,
+			body: visibleBody,
+			footer,
+		});
 	}
 
 	invalidate(): void {
@@ -406,13 +406,7 @@ async function openSideChat(args: string, ctx: ExtensionCommandContext): Promise
 		{
 			overlay: true,
 			onHandle: (handle) => handle.focus(),
-			overlayOptions: {
-				anchor: "right-center",
-				width: "48%",
-				minWidth: 50,
-				maxHeight: "85%",
-				margin: 1,
-			},
+			overlayOptions: CENTER_FLOATING_OVERLAY,
 		},
 	);
 }
